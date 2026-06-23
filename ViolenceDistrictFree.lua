@@ -1,11 +1,12 @@
 --[[
     ╔══════════════════════════════════════╗
-    ║        CrimsonX Hub v4.0             ║
-    ║  Violence District • WindUI Proper   ║
+    ║        CrimsonX Hub v5.1             ║
+    ║  Violence District • WindUI          ║
     ╚══════════════════════════════════════╝
-    - WindUI by Footagesus (API sesuai contoh resmi)
-    - OpenButton: floating button buat buka UI di mobile
-    - Anti teleport spam, anti emote, FPS-independent skill check
+    v5.1 — Tombol Oren (action.main) pakai SendTouchEvent
+    Skill check (action.check) pakai SendTouchEvent TouchID 8822
+    Generator cari di workspace.Map
+    Semua resolusi HP otomatis (koordinat dinamis)
 ]]
 
 -- =============================================
@@ -19,23 +20,24 @@ local CoreGui             = game:GetService("CoreGui")
 local LocalPlayer         = Players.LocalPlayer
 
 -- =============================================
--- LOAD WINDUI  (cara resmi sesuai contoh)
+-- LOAD WINDUI
 -- =============================================
 local WindUI = loadstring(
     game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua")
 )()
 
 -- =============================================
--- CONFIG / STATE
+-- CONFIG
 -- =============================================
 _G.CX = _G.CX or {
     Toggles = {
-        AutoFarm  = false,
-        AutoFix   = false,
-        EspPlayer = false,
-        EspGen    = false,
-        EspHook   = false,
-        AimLock   = false,
+        AutoFarm   = false,
+        AutoFix    = false,
+        AutoHook   = false,
+        EspPlayer  = false,
+        EspGen     = false,
+        EspHook    = false,
+        AimLock    = false,
     },
     Aimbot = {
         Target  = "Killer",
@@ -47,292 +49,126 @@ _G.CX = _G.CX or {
 local T  = _G.CX.Toggles
 local AB = _G.CX.Aimbot
 
-local FinishedGenerators = {}
-local ESPObjects         = {}
-local HeartbeatConn      = nil
-local NeedleVelocity     = 0
-local LastNeedleAngle    = nil
-local LastNeedleTime     = nil
-
--- Anti-spam teleport
-local CurrentTargetGen   = nil
-local IsAtGenerator      = false
-local LastTeleportTime   = 0
-local TELE_COOLDOWN      = 2.5
+-- =============================================
+-- CONSTANTS (dari referensi script VD)
+-- =============================================
+local TOUCH_ID_SKILLCHECK = 8822
+local TOUCH_ID_INTERACT   = 8823
+local PATH_CHECK  = "Survivor-mob.Controls.action.check"
+local PATH_MAIN   = "Survivor-mob.Controls.action.main"
+local INTERACT_DISTANCE = 12  -- stud
 
 -- =============================================
--- BUAT WINDOW  (sesuai API contoh resmi)
+-- STATE
 -- =============================================
-local Window = WindUI:CreateWindow({
-    Title       = "CrimsonX Hub",
-    Icon        = "solar:skull-bold",
-    Folder      = "CrimsonX",
-    NewElements = true,
-
-    -- Floating open-button — penting untuk mobile/Delta
-    OpenButton = {
-        Title         = "CrimsonX Hub",
-        CornerRadius  = UDim.new(1, 0),
-        StrokeThickness = 2,
-        Enabled       = true,
-        Draggable     = true,
-        OnlyMobile    = false,
-        Scale         = 0.5,
-        Color         = ColorSequence.new(
-            Color3.fromHex("#C0392B"),
-            Color3.fromHex("#8E44AD")
-        ),
-    },
-
-    Topbar = {
-        Height      = 44,
-        ButtonsType = "Mac",
-    },
-})
-
--- Version tag
-Window:Tag({
-    Title  = "v4.0  Violence District",
-    Icon   = "github",
-    Color  = Color3.fromHex("#1c1c1c"),
-    Border = true,
-})
+local ActiveGenerators    = {}
+local ESPObjects          = {}
+local VisibilityConn      = nil
+local RenderConn          = nil
+local InteractDebounce    = false
+local CurrentTargetGen    = nil
+local IsAtGenerator       = false
+local LastTeleportTime    = 0
+local TELE_COOLDOWN       = 2.5
 
 -- =============================================
--- TAB: FARM
+-- CORE HELPER: Navigasi path PlayerGui
+-- Contoh: "Survivor-mob.Controls.action.main"
 -- =============================================
-local FarmTab = Window:Tab({
-    Title  = "Farm",
-    Icon   = "solar:widget-bold",
-    Border = true,
-})
-
-local GenSection = FarmTab:Section({ Title = "Generator" })
-
-GenSection:Toggle({
-    Title    = "Auto Farm Generator",
-    Desc     = "Teleport ke generator terdekat & repair otomatis",
-    Callback = function(v)
-        T.AutoFarm = v
-        if not v then
-            FinishedGenerators = {}
-            IsAtGenerator      = false
-            CurrentTargetGen   = nil
-        end
-    end,
-})
-
-GenSection:Space()
-
-GenSection:Toggle({
-    Title    = "Auto Perfect Skill Check",
-    Desc     = "FPS-independent, prediksi 2 frame ke depan",
-    Callback = function(v)
-        T.AutoFix = v
-        if not v and HeartbeatConn then
-            HeartbeatConn:Disconnect()
-            HeartbeatConn   = nil
-            LastNeedleAngle = nil
-            LastNeedleTime  = nil
-            NeedleVelocity  = 0
-        end
-    end,
-})
+local function GetActionTarget(path)
+    local pg = LocalPlayer.PlayerGui
+    local cur = pg
+    for seg in string.gmatch(path, "[^%.]+") do
+        cur = cur and cur:FindFirstChild(seg)
+    end
+    return cur
+end
 
 -- =============================================
--- TAB: ESP
+-- CORE HELPER: SendTouchEvent (resolusi-independent)
+-- Cara ini proven work untuk tombol VD di semua HP
 -- =============================================
-local EspTab = Window:Tab({
-    Title  = "ESP",
-    Icon   = "solar:eye-bold",
-    Border = true,
-})
-
-local EspPlayerSection = EspTab:Section({ Title = "Player" })
-
-EspPlayerSection:Toggle({
-    Title    = "Killer & Survivor ESP",
-    Desc     = "Killer = merah  |  Survivor = hijau",
-    Callback = function(v) T.EspPlayer = v end,
-})
-
-EspTab:Space()
-
-local EspObjSection = EspTab:Section({ Title = "Object" })
-
-EspObjSection:Toggle({
-    Title    = "Generator ESP  +  Progress %",
-    Desc     = "Warna ungu → hijau sesuai % repair",
-    Callback = function(v) T.EspGen = v end,
-})
-
-EspObjSection:Space()
-
-EspObjSection:Toggle({
-    Title    = "Hook ESP",
-    Desc     = "Orange = kosong  |  Merah = ada korban",
-    Callback = function(v) T.EspHook = v end,
-})
+local function TriggerMobileButton(btn, touchID)
+    if not btn then return end
+    local p   = btn.AbsolutePosition
+    local s   = btn.AbsoluteSize
+    local ins = GuiService:GetGuiInset()
+    local cx  = p.X + (s.X * 0.5) + ins.X
+    local cy  = p.Y + (s.Y * 0.5) + ins.Y
+    pcall(function()
+        VirtualInputManager:SendTouchEvent(touchID, 0, cx, cy)  -- Begin
+        task.wait(0.05)
+        VirtualInputManager:SendTouchEvent(touchID, 2, cx, cy)  -- End
+    end)
+end
 
 -- =============================================
--- TAB: SILENT AIM
+-- SKILL CHECK ENGINE (proven dari referensi)
+-- GUI: SkillCheckPromptGui > Check > Line + Goal
+-- Arc: Goal+102 s/d Goal+114 (dari source resmi VD)
+-- Button: action.check via SendTouchEvent TouchID 8822
 -- =============================================
-local AimTab = Window:Tab({
-    Title  = "Silent Aim",
-    Icon   = "solar:target-bold",
-    Border = true,
-})
+local function SetupSkillCheck(pg)
+    if VisibilityConn then VisibilityConn:Disconnect(); VisibilityConn = nil end
+    if RenderConn     then RenderConn:Disconnect();     RenderConn     = nil end
 
-local AimSection = AimTab:Section({ Title = "Aimbot" })
+    task.spawn(function()
+        local prompt = pg:WaitForChild("SkillCheckPromptGui", 15)
+        if not prompt then return end
+        local check = prompt:WaitForChild("Check", 10)
+        if not check then return end
+        local line = check:WaitForChild("Line", 5)
+        local goal = check:WaitForChild("Goal", 5)
+        if not line or not goal then return end
 
-AimSection:Toggle({
-    Title    = "Enable Aim Lock",
-    Desc     = "Silent — tidak kelihatan dari sisi server",
-    Callback = function(v) T.AimLock = v end,
-})
-
-AimSection:Space()
-
-AimSection:Dropdown({
-    Title    = "Target Role",
-    Desc     = "Pilih siapa yang di-lock",
-    Options  = { "Killer", "Survivors" },
-    Default  = "Killer",
-    Callback = function(v) AB.Target = v end,
-})
-
-AimSection:Space()
-
-AimSection:Dropdown({
-    Title    = "Aim Part",
-    Desc     = "Bagian tubuh yang ditarget",
-    Options  = { "HumanoidRootPart", "Head", "UpperTorso", "LowerTorso" },
-    Default  = "HumanoidRootPart",
-    Callback = function(v) AB.AimPart = v end,
-})
-
-AimSection:Space()
-
-AimSection:Slider({
-    Title    = "FOV Radius",
-    Desc     = "Radius deteksi target",
-    Min      = 50,
-    Max      = 1000,
-    Default  = 300,
-    Callback = function(v) AB.FOV = v end,
-})
-
-AimSection:Space()
-
-AimSection:Slider({
-    Title    = "Prediction",
-    Desc     = "Kompensasi pergerakan target",
-    Min      = 0,
-    Max      = 0.5,
-    Default  = 0.04,
-    Callback = function(v) AB.Predict = v end,
-})
-
--- =============================================
--- TAB: INFO
--- =============================================
-local InfoTab = Window:Tab({
-    Title  = "Info",
-    Icon   = "solar:info-square-bold",
-    Border = true,
-})
-
-local InfoSection = InfoTab:Section({ Title = "CrimsonX Hub  v4.0" })
-
-InfoSection:Button({
-    Title    = "Reset Finished Generators",
-    Desc     = "Paksa ulang semua generator (kalau stuck)",
-    Icon     = "solar:restart-bold",
-    Justify  = "Center",
-    Callback = function()
-        FinishedGenerators = {}
-        IsAtGenerator      = false
-        CurrentTargetGen   = nil
-        WindUI:Notify({ Title = "CrimsonX", Content = "Generator list direset!" })
-    end,
-})
-
-InfoSection:Space()
-
-InfoSection:Button({
-    Title    = "Hapus Semua ESP",
-    Icon     = "solar:eye-closed-bold",
-    Justify  = "Center",
-    Color    = Color3.fromHex("#C0392B"),
-    Callback = function()
-        T.EspPlayer = false
-        T.EspGen    = false
-        T.EspHook   = false
-        for inst, d in pairs(ESPObjects) do
-            pcall(function() if d.h then d.h:Destroy() end end)
-            pcall(function() if d.b then d.b:Destroy() end end)
-            ESPObjects[inst] = nil
-        end
-        WindUI:Notify({ Title = "CrimsonX", Content = "Semua ESP dihapus!" })
-    end,
-})
-
--- =============================================
--- CLICK ENGINE  (spesifik VD, anti-emote)
--- Path: Survivor-mob > Controls > action > check
--- TIDAK ada fallback ke GuiButton random
--- =============================================
-local function FindRepairButton()
-    local pg  = LocalPlayer.PlayerGui
-    local mob = pg:FindFirstChild("Survivor-mob") or pg:FindFirstChild("Survivor-mob", true)
-    if not mob then return nil end
-
-    local controls = mob:FindFirstChild("Controls")
-    if controls then
-        local action = controls:FindFirstChild("action")
-        if action then
-            local check = action:FindFirstChild("check")
-            if check and check:IsA("GuiButton") and check.Visible then return check end
-            for _, v in pairs(action:GetChildren()) do
-                if v:IsA("GuiButton") and v.Visible then return v end
+        local function LineInGoal()
+            local lr = line.Rotation % 360
+            local gr = goal.Rotation % 360
+            local ss = (gr + 102) % 360
+            local se = (gr + 114) % 360
+            if ss < se then
+                return lr >= ss and lr <= se
+            else
+                return lr >= ss or lr <= se
             end
         end
-    end
 
-    local check = mob:FindFirstChild("check", true)
-    if check and check:IsA("GuiButton") and check.Visible then return check end
-    return nil
-end
-
-local function ClickRepairButton()
-    local btn = FindRepairButton()
-    if not btn then return false end
-    if type(firesignal) == "function" then
-        pcall(firesignal, btn.MouseButton1Click)
-        pcall(firesignal, btn.Activated)
-        return true
-    end
-    if type(getconnections) == "function" then
-        pcall(function()
-            for _, c in pairs(getconnections(btn.MouseButton1Click)) do pcall(c.Fire, c) end
-            for _, c in pairs(getconnections(btn.Activated))         do pcall(c.Fire, c) end
+        VisibilityConn = check:GetPropertyChangedSignal("Visible"):Connect(function()
+            if not T.AutoFix then return end
+            if check.Visible then
+                if RenderConn then RenderConn:Disconnect() end
+                RenderConn = RunService.RenderStepped:Connect(function()
+                    if not T.AutoFix then
+                        if RenderConn then RenderConn:Disconnect(); RenderConn = nil end
+                        return
+                    end
+                    if LineInGoal() then
+                        local btn = GetActionTarget(PATH_CHECK)
+                        TriggerMobileButton(btn, TOUCH_ID_SKILLCHECK)
+                        if RenderConn then RenderConn:Disconnect(); RenderConn = nil end
+                    end
+                end)
+            else
+                if RenderConn then RenderConn:Disconnect(); RenderConn = nil end
+            end
         end)
-        return true
-    end
-    pcall(function()
-        local p   = btn.AbsolutePosition
-        local s   = btn.AbsoluteSize
-        local ins = GuiService:GetGuiInset()
-        VirtualInputManager:SendMouseButtonEvent(p.X+s.X*.5+ins.X, p.Y+s.Y*.5+ins.Y, 0, true,  game, 0)
-        task.wait(0.02)
-        VirtualInputManager:SendMouseButtonEvent(p.X+s.X*.5+ins.X, p.Y+s.Y*.5+ins.Y, 0, false, game, 0)
     end)
-    return true
 end
 
 -- =============================================
--- GENERATOR HELPERS
+-- GENERATOR LIST: ambil dari workspace.Map
 -- =============================================
+local function RefreshGenerators()
+    ActiveGenerators = {}
+    local Map = workspace:FindFirstChild("Map")
+    if not Map then return end
+    for _, obj in ipairs(Map:GetDescendants()) do
+        if obj.Name == "Generator" then
+            table.insert(ActiveGenerators, obj)
+        end
+    end
+end
+
 local function GetGenProgress(gen)
     for _, name in ipairs({"RepairProgress","Progress","Percent","ProgressValue"}) do
         local attr = gen:GetAttribute(name)
@@ -347,102 +183,32 @@ end
 
 local function GetGenPart(gen)
     if gen:IsA("BasePart") then return gen end
-    return gen:FindFirstChild("Main")
-        or gen:FindFirstChild("HumanoidRootPart")
-        or gen:FindFirstChildWhichIsA("BasePart",true)
-end
-
-local function GetAllGenerators()
-    local r = {}
-    for _, obj in pairs(workspace:GetDescendants()) do
-        if obj.Name=="Generator" and (obj:IsA("Model") or obj:IsA("BasePart")) then
-            table.insert(r, obj)
-        end
-    end
-    return r
+    return gen:FindFirstChildWhichIsA("BasePart", true)
 end
 
 -- =============================================
--- SKILL CHECK  (FPS-independent heartbeat)
--- =============================================
-local function FindSkillCheck()
-    for _, gui in pairs(LocalPlayer.PlayerGui:GetChildren()) do
-        for _, name in ipairs({"Check","SkillCheck","RepairCheck","CheckUI"}) do
-            local check = gui:FindFirstChild(name,true)
-            if check and check.Visible then
-                local needle = check:FindFirstChild("Line") or check:FindFirstChild("Needle") or check:FindFirstChild("Arrow")
-                local goal   = check:FindFirstChild("Goal") or check:FindFirstChild("Target") or check:FindFirstChild("Zone") or check:FindFirstChild("Perfect") or check:FindFirstChild("White")
-                if needle and goal then return check, needle, goal end
-            end
-        end
-    end
-    return nil, nil, nil
-end
-
-local function InArc(a,s,e)
-    a,s,e = a%360,s%360,e%360
-    if s<=e then return a>=s and a<=e else return a>=s or a<=e end
-end
-
-local function OnHeartbeat()
-    if not T.AutoFix then return end
-    local _, needle, goal = FindSkillCheck()
-    if not needle or not goal then return end
-    local now = tick()
-    local ang = needle.Rotation % 360
-    if LastNeedleAngle and LastNeedleTime then
-        local dt   = now - LastNeedleTime
-        local dAng = (ang - LastNeedleAngle + 360) % 360
-        if dAng > 180 then dAng = dAng - 360 end
-        if dt > 0 then NeedleVelocity = dAng / dt end
-    end
-    LastNeedleAngle = ang; LastNeedleTime = now
-    local goalAng = goal.Rotation % 360
-    local pred    = (ang + NeedleVelocity * (1/60) * 2) % 360
-    local s,e     = (goalAng-10)%360, (goalAng+10)%360
-    if InArc(ang,s,e) or InArc(pred,s,e) then
-        ClickRepairButton()
-        LastNeedleAngle=nil; LastNeedleTime=nil; NeedleVelocity=0
-        if HeartbeatConn then HeartbeatConn:Disconnect(); HeartbeatConn=nil end
-    end
-end
-
-task.spawn(function()
-    while task.wait(0.05) do
-        if T.AutoFix then
-            local c,n,g = FindSkillCheck()
-            if c and n and g then
-                if not HeartbeatConn then HeartbeatConn = RunService.Heartbeat:Connect(OnHeartbeat) end
-            else
-                if HeartbeatConn then HeartbeatConn:Disconnect(); HeartbeatConn=nil end
-            end
-        else
-            if HeartbeatConn then HeartbeatConn:Disconnect(); HeartbeatConn=nil end
-        end
-    end
-end)
-
--- =============================================
--- AUTO FARM  (anti teleport spam)
+-- AUTO FARM
+-- 1. Teleport ke generator terdekat (sekali)
+-- 2. Tekan tombol Oren (action.main) via SendTouchEvent
+-- 3. Skill check ditangani SetupSkillCheck di atas
 -- =============================================
 task.spawn(function()
     while task.wait(0.5) do
         if not T.AutoFarm then
             IsAtGenerator=false; CurrentTargetGen=nil; continue
         end
+        if not (LocalPlayer.Team and LocalPlayer.Team.Name=="Survivors") then continue end
         local char = LocalPlayer.Character; if not char then continue end
         local hrp  = char:FindFirstChild("HumanoidRootPart"); if not hrp then continue end
 
+        -- Cari generator belum selesai yang terdekat
         local bestPart, bestGen, bestDist = nil, nil, math.huge
         pcall(function()
-            for _, gen in pairs(GetAllGenerators()) do
+            for _, gen in ipairs(ActiveGenerators) do
                 local part = GetGenPart(gen)
-                if not part or table.find(FinishedGenerators,gen) then continue end
+                if not part then continue end
                 local pct = GetGenProgress(gen)
-                if pct >= 100 then
-                    if not table.find(FinishedGenerators,gen) then table.insert(FinishedGenerators,gen) end
-                    continue
-                end
+                if pct >= 100 then continue end
                 local d = (part.Position - hrp.Position).Magnitude
                 if d < bestDist then bestDist=d; bestPart=part; bestGen=gen end
             end
@@ -450,25 +216,134 @@ task.spawn(function()
 
         if not bestPart then IsAtGenerator=false; CurrentTargetGen=nil; continue end
 
+        -- Reset state kalau ganti target
         if bestGen ~= CurrentTargetGen then
             CurrentTargetGen=bestGen; IsAtGenerator=false
         end
 
-        if IsAtGenerator then
-            if (hrp.Position - bestPart.Position).Magnitude > 8 then IsAtGenerator=false end
+        -- Cek kalau terdorong keluar
+        if IsAtGenerator and (hrp.Position-bestPart.Position).Magnitude > 15 then
+            IsAtGenerator=false
         end
 
+        -- Teleport sekali kalau belum di sana
         local now = tick()
-        if not IsAtGenerator and bestDist > 5 and (now-LastTeleportTime) >= TELE_COOLDOWN then
+        if not IsAtGenerator and bestDist > INTERACT_DISTANCE and (now-LastTeleportTime) >= TELE_COOLDOWN then
             LastTeleportTime = now
-            pcall(function() hrp.CFrame = bestPart.CFrame * CFrame.new(0,0,3.5) end)
-            task.wait(0.6)
+            pcall(function() hrp.CFrame = bestPart.CFrame * CFrame.new(0,0,3) end)
+            task.wait(0.8)
             IsAtGenerator = true
         end
-
-        local sc = FindSkillCheck()
-        if not sc then ClickRepairButton() end
     end
+end)
+
+-- =============================================
+-- AUTO INTERACT: Tekan tombol Oren (action.main)
+-- Dijalankan di Heartbeat, cek jarak ≤12 stud
+-- Skip kalau skill check sedang aktif
+-- =============================================
+RunService.Heartbeat:Connect(function()
+    if not T.AutoFarm then return end
+    if InteractDebounce then return end
+
+    -- Jangan pencet kalau skill check lagi muncul
+    local promptUI = LocalPlayer.PlayerGui:FindFirstChild("SkillCheckPromptGui")
+    local scActive = promptUI and promptUI:FindFirstChild("Check") and promptUI.Check.Visible
+    if scActive then return end
+
+    local char = LocalPlayer.Character; if not char then return end
+    local hrp  = char:FindFirstChild("HumanoidRootPart"); if not hrp then return end
+
+    -- Cek apakah ada generator dalam jarak
+    local nearGen = false
+    for _, gen in ipairs(ActiveGenerators) do
+        local part = GetGenPart(gen)
+        if part and (part.Position - hrp.Position).Magnitude <= INTERACT_DISTANCE then
+            if GetGenProgress(gen) < 100 then
+                nearGen = true
+                break
+            end
+        end
+    end
+    if not nearGen then return end
+
+    -- Tekan tombol Oren (action.main)
+    local btn = GetActionTarget(PATH_MAIN)
+    if btn and btn.Visible then
+        InteractDebounce = true
+        TriggerMobileButton(btn, TOUCH_ID_INTERACT)
+        task.wait(0.4)
+        InteractDebounce = false
+    end
+end)
+
+-- =============================================
+-- AUTO ESCAPE HOOK
+-- =============================================
+task.spawn(function()
+    while task.wait(0.15) do
+        if not T.AutoHook then continue end
+        local pg   = LocalPlayer.PlayerGui
+        local char = LocalPlayer.Character
+        local hooked = false
+
+        -- Deteksi hook lewat berbagai cara
+        if char then
+            local attr = char:GetAttribute("IsHooked") or char:GetAttribute("Hooked")
+            if attr then hooked = true end
+        end
+
+        -- Cek GUI yang ada kata "hook"/"escape"/"struggle"
+        if not hooked then
+            for _, gui in pairs(pg:GetChildren()) do
+                local n = gui.Name:lower()
+                if (n:find("hook") or n:find("escape") or n:find("struggle")) and gui.Enabled then
+                    hooked = true; break
+                end
+            end
+        end
+
+        if hooked then
+            -- Coba tekan tombol lepas via action.main
+            local btn = GetActionTarget(PATH_MAIN)
+            if btn and btn.Visible then
+                TriggerMobileButton(btn, TOUCH_ID_INTERACT)
+            end
+        end
+    end
+end)
+
+-- =============================================
+-- RESPAWN HANDLER
+-- =============================================
+local function OnCharacterAdded(char)
+    IsAtGenerator    = false
+    CurrentTargetGen = nil
+    if VisibilityConn then VisibilityConn:Disconnect(); VisibilityConn=nil end
+    if RenderConn     then RenderConn:Disconnect();     RenderConn=nil end
+
+    task.spawn(function()
+        task.wait(2)
+        local pg = LocalPlayer:WaitForChild("PlayerGui", 15)
+        if pg then SetupSkillCheck(pg) end
+        RefreshGenerators()
+    end)
+end
+
+if LocalPlayer.Character then OnCharacterAdded(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(OnCharacterAdded)
+
+-- Refresh generator list tiap Map di-load
+workspace.ChildAdded:Connect(function(c)
+    if c.Name == "Map" then task.wait(1); RefreshGenerators() end
+end)
+
+-- Setup awal
+task.spawn(function()
+    local pg = LocalPlayer:WaitForChild("PlayerGui", 15)
+    if pg then SetupSkillCheck(pg) end
+    task.wait(2)
+    RefreshGenerators()
 end)
 
 -- =============================================
@@ -487,9 +362,16 @@ local function MakeESP(inst, adornee, color, label)
         end)
         return
     end
-    local h=Instance.new("Highlight"); h.FillColor=color; h.OutlineColor=color; h.FillTransparency=0.6; h.OutlineTransparency=0; h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; h.Adornee=adornee; h.Parent=CoreGui
-    local bg=Instance.new("BillboardGui"); bg.AlwaysOnTop=true; bg.Size=UDim2.new(0,175,0,40); bg.StudsOffset=Vector3.new(0,3.5,0); bg.Adornee=adornee; bg.Parent=CoreGui
-    local lbl=Instance.new("TextLabel",bg); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=color; lbl.Font=Enum.Font.GothamBold; lbl.TextSize=11; lbl.TextStrokeTransparency=0.4; lbl.TextWrapped=true
+    local h=Instance.new("Highlight"); h.FillColor=color; h.OutlineColor=color
+    h.FillTransparency=0.7; h.OutlineTransparency=0
+    h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; h.Adornee=adornee; h.Parent=CoreGui
+    local bg=Instance.new("BillboardGui"); bg.AlwaysOnTop=true
+    bg.Size=UDim2.new(0,180,0,40); bg.StudsOffset=Vector3.new(0,3.5,0)
+    bg.Adornee=adornee; bg.Parent=CoreGui
+    local lbl=Instance.new("TextLabel",bg); lbl.Size=UDim2.new(1,0,1,0)
+    lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=color
+    lbl.Font=Enum.Font.GothamBold; lbl.TextSize=11
+    lbl.TextStrokeTransparency=0.4; lbl.TextWrapped=true
     ESPObjects[inst]={h=h,b=bg}
 end
 
@@ -502,6 +384,7 @@ end
 
 RunService.RenderStepped:Connect(function()
     local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+
     if T.EspPlayer then
         for _, p in pairs(Players:GetPlayers()) do
             if p==LocalPlayer or not p.Character then continue end
@@ -509,13 +392,16 @@ RunService.RenderStepped:Connect(function()
             local hum=p.Character:FindFirstChildWhichIsA("Humanoid")
             local killer=p.Team and p.Team.Name:lower():find("killer")
             local color=killer and Color3.fromRGB(255,60,60) or Color3.fromRGB(60,220,120)
-            local hp=hum and math.floor(hum.Health) or 0; local mhp=hum and math.max(hum.MaxHealth,1) or 100
+            local hp=hum and math.floor(hum.Health) or 0
+            local mhp=hum and math.max(hum.MaxHealth,1) or 100
             local dist=myHRP and math.floor((hrp.Position-myHRP.Position).Magnitude) or 0
-            pcall(MakeESP, p.Character, hrp, color, ("%s [%s]\n%d/%dHP  %dm"):format(p.Name, killer and "KILLER" or "Survivor", hp, mhp, dist))
+            pcall(MakeESP, p.Character, hrp, color,
+                ("%s [%s]\n%d/%dHP  %dm"):format(p.Name,killer and "KILLER" or "Survivor",hp,mhp,dist))
         end
     end
+
     if T.EspGen then
-        for _, obj in pairs(GetAllGenerators()) do
+        for _, obj in ipairs(ActiveGenerators) do
             local part=GetGenPart(obj); if not part then continue end
             local pct=GetGenProgress(obj)
             local c=Color3.fromRGB(150,0,200):Lerp(Color3.fromRGB(0,200,80),pct/100)
@@ -523,27 +409,35 @@ RunService.RenderStepped:Connect(function()
             pcall(MakeESP, obj, part, c, ("Generator %d%%\n%dm"):format(pct,dist))
         end
     end
+
     if T.EspHook then
-        for _, obj in pairs(workspace:GetDescendants()) do
-            if obj.Name~="Hook" then continue end
-            local part=obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart",true); if not part then continue end
-            local occ=obj:GetAttribute("Occupied") or obj:FindFirstChild("Occupied")
-            local color=occ and Color3.fromRGB(255,0,0) or Color3.fromRGB(255,165,0)
-            local dist=myHRP and math.floor((part.Position-myHRP.Position).Magnitude) or 0
-            pcall(MakeESP, obj, part, color, (occ and "Hook [TERISI]\n" or "Hook\n")..dist.."m")
+        local Map = workspace:FindFirstChild("Map")
+        if Map then
+            for _, obj in ipairs(Map:GetDescendants()) do
+                if obj.Name~="Hook" then continue end
+                local part=obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart",true)
+                if not part then continue end
+                local occ=obj:GetAttribute("Occupied") or obj:FindFirstChild("Occupied")
+                local color=occ and Color3.fromRGB(255,0,0) or Color3.fromRGB(255,165,0)
+                local dist=myHRP and math.floor((part.Position-myHRP.Position).Magnitude) or 0
+                pcall(MakeESP, obj, part, color, (occ and "Hook [TERISI]\n" or "Hook\n")..dist.."m")
+            end
         end
     end
 end)
 
 Players.PlayerRemoving:Connect(function(p) if p.Character then RemoveESP(p.Character) end end)
 Players.PlayerAdded:Connect(function(p) p.CharacterRemoving:Connect(function(c) RemoveESP(c) end) end)
-for _, p in pairs(Players:GetPlayers()) do p.CharacterRemoving:Connect(function(c) RemoveESP(c) end) end
+for _, p in pairs(Players:GetPlayers()) do
+    p.CharacterRemoving:Connect(function(c) RemoveESP(c) end)
+end
 
 -- =============================================
 -- SILENT AIMBOT
 -- =============================================
 local function GetAimbotTarget()
-    local myHRP=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"); if not myHRP then return nil end
+    local myHRP=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil end
     local best,bestDist=nil,AB.FOV
     for _, p in pairs(Players:GetPlayers()) do
         if p==LocalPlayer or not p.Character then continue end
@@ -592,4 +486,121 @@ pcall(function()
     setreadonly(MT,true)
 end)
 
-print("[CrimsonX v4.0] Semua sistem aktif!")
+-- =============================================
+-- WINDUI WINDOW
+-- =============================================
+local Window = WindUI:CreateWindow({
+    Title       = "CrimsonX Hub",
+    Icon        = "solar:skull-bold",
+    Folder      = "CrimsonX",
+    NewElements = true,
+    OpenButton  = {
+        Title           = "CrimsonX",
+        CornerRadius    = UDim.new(1,0),
+        StrokeThickness = 2,
+        Enabled         = true,
+        Draggable       = true,
+        OnlyMobile      = false,
+        Scale           = 0.5,
+        Color           = ColorSequence.new(
+            Color3.fromHex("#C0392B"),
+            Color3.fromHex("#8E44AD")
+        ),
+    },
+    Topbar = { Height=44, ButtonsType="Mac" },
+})
+
+Window:Tag({ Title="v5.1  |  Violence District", Icon="github", Color=Color3.fromHex("#1c1c1c"), Border=true })
+
+-- TAB: FARM
+local FarmTab = Window:Tab({ Title="Farm", Icon="solar:widget-bold", Border=true })
+
+local FarmSec = FarmTab:Section({ Title="Generator" })
+FarmSec:Toggle({
+    Title    = "Auto Farm Generator",
+    Desc     = "Teleport ke gen, tekan tombol Oren otomatis",
+    Callback = function(v)
+        T.AutoFarm = v
+        if not v then IsAtGenerator=false; CurrentTargetGen=nil end
+    end,
+})
+
+FarmSec:Space()
+
+FarmSec:Toggle({
+    Title    = "Auto Perfect Skill Check",
+    Desc     = "SendTouchEvent saat jarum di zona 102–114° dari Goal",
+    Callback = function(v) T.AutoFix = v end,
+})
+
+FarmSec:Space()
+
+FarmSec:Toggle({
+    Title    = "Auto Escape Hook",
+    Desc     = "Tekan tombol lepas saat di-hook otomatis",
+    Callback = function(v) T.AutoHook = v end,
+})
+
+-- TAB: ESP
+local EspTab = Window:Tab({ Title="ESP", Icon="solar:eye-bold", Border=true })
+
+local EspPS = EspTab:Section({ Title="Player ESP" })
+EspPS:Toggle({ Title="Killer & Survivor ESP", Desc="Merah=Killer | Hijau=Survivor + HP + Jarak", Callback=function(v) T.EspPlayer=v end })
+
+EspTab:Space()
+
+local EspOS = EspTab:Section({ Title="Object ESP" })
+EspOS:Toggle({ Title="Generator ESP + Progress %", Desc="Ungu→Hijau sesuai % repair", Callback=function(v) T.EspGen=v end })
+EspOS:Space()
+EspOS:Toggle({ Title="Hook ESP", Desc="Orange=kosong | Merah=ada korban", Callback=function(v) T.EspHook=v end })
+
+-- TAB: SILENT AIM
+local AimTab = Window:Tab({ Title="Silent Aim", Icon="solar:target-bold", Border=true })
+local AimSec = AimTab:Section({ Title="Aimbot" })
+
+AimSec:Toggle({ Title="Enable Aim Lock", Desc="Silent — tidak terlihat server", Callback=function(v) T.AimLock=v end })
+AimSec:Space()
+AimSec:Dropdown({
+    Title="Target Role", Desc="Siapa yang di-lock",
+    Options={"Killer","Survivors"}, Default="Killer",
+    Callback=function(v) AB.Target=(type(v)=="table") and v[1] or v end,
+})
+AimSec:Space()
+AimSec:Dropdown({
+    Title="Aim Part", Desc="Bagian tubuh target",
+    Options={"HumanoidRootPart","Head","UpperTorso","LowerTorso"}, Default="HumanoidRootPart",
+    Callback=function(v) AB.AimPart=(type(v)=="table") and v[1] or v end,
+})
+AimSec:Space()
+AimSec:Slider({ Title="FOV Radius", Min=50, Max=1000, Default=300, Callback=function(v) AB.FOV=v end })
+AimSec:Space()
+AimSec:Slider({ Title="Prediction", Min=0, Max=0.5, Default=0.04, Callback=function(v) AB.Predict=v end })
+
+-- TAB: INFO
+local InfoTab = Window:Tab({ Title="Info", Icon="solar:info-square-bold", Border=true })
+local InfoSec = InfoTab:Section({ Title="Tools" })
+
+InfoSec:Button({
+    Title="Refresh Generator List", Icon="solar:restart-bold", Justify="Center",
+    Callback=function()
+        RefreshGenerators()
+        IsAtGenerator=false; CurrentTargetGen=nil
+        WindUI:Notify({ Title="CrimsonX", Content="Generator list diperbarui! ("..#ActiveGenerators.." gen)" })
+    end,
+})
+InfoSec:Space()
+InfoSec:Button({
+    Title="Hapus Semua ESP", Icon="solar:eye-closed-bold", Justify="Center",
+    Color=Color3.fromHex("#C0392B"),
+    Callback=function()
+        T.EspPlayer=false; T.EspGen=false; T.EspHook=false
+        for inst,d in pairs(ESPObjects) do
+            pcall(function() if d.h then d.h:Destroy() end end)
+            pcall(function() if d.b then d.b:Destroy() end end)
+            ESPObjects[inst]=nil
+        end
+        WindUI:Notify({ Title="CrimsonX", Content="Semua ESP dihapus!" })
+    end,
+})
+
+print("[CrimsonX v5.1] Semua sistem aktif! Generator: " .. #ActiveGenerators)
